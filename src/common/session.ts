@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type {
   ActionMap,
   ActionName,
@@ -10,16 +11,24 @@ import type {
 /** Server-side view of one connected charge point. */
 export abstract class OcppSession<Out extends ActionMap = ActionMap> {
   /** Charge point identity (last URL segment for OCPP-J, `chargeBoxIdentity` for SOAP). */
+  /** Unique id of this session (stable across cluster nodes). */
+  readonly id: string;
   readonly clientId: string;
   /** Negotiated protocol, e.g. `ocpp1.6` or `ocpp2.0.1`. */
   readonly protocol: string;
-  readonly connectedAt = new Date();
+  readonly connectedAt: Date;
   /** Free-form storage for application data attached to this session. */
   readonly data = new Map<string, unknown>();
 
-  protected constructor(clientId: string, protocol: string) {
+  protected constructor(
+    clientId: string,
+    protocol: string,
+    { id = randomUUID(), connectedAt = new Date() }: { id?: string; connectedAt?: Date } = {},
+  ) {
+    this.id = id;
     this.clientId = clientId;
     this.protocol = protocol;
+    this.connectedAt = connectedAt;
   }
 
   abstract get connected(): boolean;

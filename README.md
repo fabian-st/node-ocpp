@@ -116,6 +116,7 @@ SOAP messages are validated as XML against the XSD embedded in the WSDL of their
 | `callTimeout`       | `30000`                                   | ms to wait for responses to outbound calls                                        |
 | `logger`            | silent                                    | anything with `debug/info/warn/error` (console, pino, …)                          |
 | `protocols`         | all with WSDL                             | **SOAP only**: accepted versions (`ocpp1.2`, `ocpp1.5`, `ocpp1.6`)                |
+| `cluster`           | –                                         | join a cluster, see [Horizontal scaling](#horizontal-scaling)                     |
 | `wsdlDir`           | bundled `schemas/wsdl`                    | **SOAP only**                                                                     |
 
 ### Authentication
@@ -143,7 +144,45 @@ http.listen(8080);
 ### Events
 
 `connection_request`, `client_connected (session)`, `client_disconnected (session, { code, reason })`,
-`validation_error (error, session)`.
+`validation_error (error, session)`; clustered also `remote_client_connected (info)` and
+`remote_client_disconnected (info, reason)`.
+
+## Horizontal scaling
+
+Run several instances behind a load balancer (no sticky sessions required) and let them share a
+`ClusterAdapter`:
+
+```ts
+import { Redis } from 'ioredis';               // optional peer dependency
+import { RedisAdapter } from 'node-ocpp/redis';
+
+const cs = new ocpp16j.Server({ cluster: { adapter: new RedisAdapter({ redis: new Redis() }) } });
+
+await cs.send('CP-1', 'Reset', { type: 'Soft' }); // reaches CP-1 on whichever node it is connected to
+await cs.isConnected('CP-1');                     // cluster-wide presence
+await cs.locate('CP-1');                          // { nodeId, sessionId, protocol, connectedAt, local }
+await cs.clientIds();
+cs.on('remote_client_connected', (info) => …);    // + remote_client_disconnected
+```
+
+- **Routed calls**: `send()` for a charge point on another node is forwarded to that node, executed
+  there (validation, queueing) and answered back; errors (`OcppError`, `ValidationError`,
+  `TimeoutError`, …) arrive as such, `AbortSignal`s cancel across nodes. The `timeout` covers
+  queueing on the remote node as well.
+- **Eviction**: if a charge point reconnects to another node while a stale socket is still open, the
+  older connection is closed.
+- **Crashed nodes**: each node heartbeats; sessions of nodes that stopped are ignored and cleaned up.
+- **OCPP-S**: sessions (endpoint, protocol, password hash, last activity) live in the shared store
+  with `sessionTimeout` as TTL, so any node can receive requests and call the charge point back
+  without authorizing it again. `client_connected`/`client_disconnected` are emitted by the node
+  that authorized the session; the others see `remote_client_*`.
+- `sessions` stays node-local. `cluster: { adapter, namespace, nodeId, nodeTtl }` — all nodes of one
+  logical server need the same `namespace` (default `ocpp:<subprotocol>` / `ocpp:soap`).
+
+Adapters implement five primitives (`publish`, `subscribe`, `set` with TTL, `get`, compare-and-
+`delete`, prefix `scan`); `MemoryAdapter` (in-process, for tests) and `RedisAdapter` (ioredis ≥ 5,
+single Redis or Sentinel — not Redis Cluster) are included. Run the Redis test suite with
+`REDIS_URL=redis://localhost:6379 npm test`.
 
 ## Client options (OCPP-J)
 
@@ -194,6 +233,8 @@ npm run build
 src/common/   transport-independent core: base classes, router, codec, validation, RPC framing
 src/ws/       OCPP-J transport (server, client, session, upgrade routing)
 src/soap/     OCPP-S transport (WSDL registry, XSD validation, responder, caller, legacy adapter)
+src/common/cluster/  cluster membership, adapter interface, in-memory adapter
+src/redis/    Redis cluster adapter (node-ocpp/redis)
 src/ocpp16j/  OCPP 1.6J  — Server, Client, generated types (also exported as `ocpp16`)
 src/ocpp16s/  OCPP 1.6S  — Server, Client (shares the 1.6 types)
 src/ocpp201/  OCPP 2.0.1 — Server, Client, generated types

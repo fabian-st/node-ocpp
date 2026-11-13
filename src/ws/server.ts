@@ -48,6 +48,11 @@ export abstract class WsServer<In extends ActionMap, Out extends ActionMap>
     return this.spec.subprotocol;
   }
 
+  /** Closes a session superseded by a newer connection of the same charge point on another node. */
+  protected override evictSession(session: WsSession<Out>): void {
+    void session.close(1000, 'Replaced by a newer connection');
+  }
+
   attach(server: HttpServer): this {
     UpgradeRouter.for(server).add(this);
     return this;

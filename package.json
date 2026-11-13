@@ -29,6 +29,10 @@
       "types": "./dist/ocpp201/index.d.ts",
       "default": "./dist/ocpp201/index.js"
     },
+    "./redis": {
+      "types": "./dist/redis/index.d.ts",
+      "default": "./dist/redis/index.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [
@@ -43,7 +47,9 @@
     "ev",
     "charging",
     "websocket",
-    "soap"
+    "soap",
+    "cluster",
+    "redis"
   ],
   "scripts": {
     "generate": "node scripts/generate-types.ts && prettier --log-level warn --write \"src/*/*.generated.ts\"",
@@ -63,9 +69,18 @@
     "ws": "^8.22.0",
     "xmllint-wasm": "^5.3.0"
   },
+  "peerDependencies": {
+    "ioredis": ">=5"
+  },
+  "peerDependenciesMeta": {
+    "ioredis": {
+      "optional": true
+    }
+  },
   "devDependencies": {
     "@types/node": "^26.6.6",
     "@types/ws": "^8.18.2",
+    "ioredis": "^6.0.0",
     "prettier": "^3.9.10",
     "typescript": "^7.0.2",
     "vitest": "^5.0.5"

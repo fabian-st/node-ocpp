@@ -23,6 +23,9 @@ export {
 export { OcppServer, type ServerOptions, type ServerEvents } from './common/server.js';
 export { OcppClient, type ClientOptions, type ClientEvents } from './common/client.js';
 export { OcppSession } from './common/session.js';
+export type { ClusterAdapter } from './common/cluster/adapter.js';
+export { MemoryAdapter } from './common/cluster/memory.js';
+export type { ClusterOptions, SessionInfo } from './common/cluster/cluster.js';
 export { ConnectionRequest, type ConnectionDecision } from './common/connection-request.js';
 export { Call, CallResult, CallError, MessageTypeId, type RpcMessage } from './common/rpc.js';
 export type { Logger } from './common/logger.js';

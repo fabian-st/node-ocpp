@@ -1,4 +1,8 @@
+import { createHash } from 'node:crypto';
 import type { IncomingMessage, Server as HttpServer, ServerResponse } from 'node:http';
+import type { SessionInfo, SessionRecord } from '../common/cluster/cluster.js';
+import { ConnectionError } from '../common/errors.js';
+import type { CallOptions } from '../common/types.js';
 import type { PayloadCodec, PayloadValidator } from '../common/codec.js';
 import { ConnectionRequest } from '../common/connection-request.js';
 import { basicCredentials, verifiedCertificate } from '../common/http-auth.js';
@@ -26,10 +30,16 @@ type Pipeline = {
   inbound: InboundDispatcher<SoapSession<CentralSystemActions>>;
 };
 
+type Session = SoapSession<CentralSystemActions>;
+
 /**
  * OCPP-S central system (SOAP 1.2 + WS-Addressing). Accepts OCPP 1.2, 1.5 and 1.6
  * charge points — each validated against its own WSDL — and presents them all
  * with OCPP 1.6 payload types.
+ *
+ * Clustered, sessions live in the shared store: any node may receive a charge point's
+ * requests and call it back. Each node keeps a local copy of the sessions it deals with;
+ * `client_connected`/`client_disconnected` are emitted by the node that authorized the session.
  */
 export class SoapServer extends OcppServer<
   ChargePointActions,
@@ -42,9 +52,16 @@ export class SoapServer extends OcppServer<
   readonly #pipelines = new WeakMap<SoapSession<CentralSystemActions>, Pipeline>();
   readonly #opening = new Map<string, Promise<SoapSession<CentralSystemActions> | SoapFault>>();
   readonly #listeners = new Map<HttpServer, (req: IncomingMessage, res: ServerResponse) => void>();
+  /** Sessions authorized by another node and taken over from the cluster store. */
+  readonly #adopted = new WeakSet<Session>();
+  readonly #records = new WeakMap<Session, SessionRecord>();
 
   constructor(options: SoapServerOptions = {}) {
-    super(protocol, { sessionTimeout: 15 * 60_000, ...options });
+    super(protocol, {
+      sessionTimeout: 15 * 60_000,
+      ...options,
+      cluster: options.cluster && { namespace: 'ocpp:soap', ...options.cluster },
+    });
     this.#registry = WsdlRegistry.load(options.wsdlDir);
     this.#registry.catch((error: unknown) => this.logger.error('Failed to load WSDLs', error));
     this.#responder = new SoapResponder({
@@ -105,7 +122,7 @@ export class SoapServer extends OcppServer<
     request: IncomingMessage,
     envelope: Envelope,
     service: OcppService,
-  ): Promise<ResolvedRequest<SoapSession<CentralSystemActions>> | SoapFault> {
+  ): Promise<ResolvedRequest<Session> | SoapFault> {
     const clientId = envelope.headers.chargeBoxIdentity;
     if (!clientId) {
       return {
@@ -117,13 +134,19 @@ export class SoapServer extends OcppServer<
     }
     const password =
       this.options.basicAuth === false ? undefined : basicCredentials(request)?.password;
+    const passwordHash = hashPassword(clientId, password);
 
     let session = this.sessions.get(clientId);
-    if (!session || session.protocol !== service.protocol || session.password !== password) {
+    if (
+      !session ||
+      !session.connected ||
+      session.protocol !== service.protocol ||
+      session.passwordHash !== passwordHash
+    ) {
       // Several requests of a new charge point may arrive at once: authorize only once.
       let opening = this.#opening.get(clientId);
       if (!opening) {
-        opening = this.#open(request, clientId, service, password).finally(() =>
+        opening = this.#open(request, clientId, service, password, passwordHash).finally(() =>
           this.#opening.delete(clientId),
         );
         this.#opening.set(clientId, opening);
@@ -133,6 +156,7 @@ export class SoapServer extends OcppServer<
       session = result;
     }
     session.touch(envelope.headers.from);
+    this.#refresh(session);
     return { session, ...this.#pipelines.get(session)! };
   }
 
@@ -141,7 +165,18 @@ export class SoapServer extends OcppServer<
     clientId: string,
     service: OcppService,
     password: string | undefined,
-  ): Promise<SoapSession<CentralSystemActions> | SoapFault> {
+    passwordHash: string | undefined,
+  ): Promise<Session | SoapFault> {
+    // Known to the cluster (authorized by another node) with the same credentials?
+    const record = await this.cluster?.lookup(clientId);
+    if (
+      record &&
+      record.protocol === service.protocol &&
+      record.data?.['passwordHash'] === passwordHash
+    ) {
+      return this.#adopt(record);
+    }
+
     const decision = await this.authorize(
       new ConnectionRequest({
         clientId,
@@ -161,27 +196,139 @@ export class SoapServer extends OcppServer<
       };
     }
 
-    const registry = await this.#registry;
-    const validation = resolveValidation(this.options.validation);
-    let session!: SoapSession<CentralSystemActions>;
-    const pipeline = this.createPipeline(() => session);
-    session = new SoapSession<CentralSystemActions>({
-      clientId,
-      protocol: service.protocol,
-      service: registry.service(service.protocol, 'ChargePoint'),
-      spec: this.spec,
-      outbound: this.outboundAllowed,
-      validation,
-      logger: this.logger,
-      callTimeout: this.options.callTimeout ?? 30_000,
-      timeout: this.options.sessionTimeout!,
-      password,
-      onClose: (s, reason) => this.removeSession(s, { reason }),
-      codec: pipeline.codec,
-    });
-    this.#pipelines.set(session, pipeline);
+    const session = await this.#create({ clientId, protocol: service.protocol, passwordHash });
     this.logger.info(`[${clientId}] connected via SOAP ${service.protocol}`);
     this.addSession(session);
     return session;
   }
+
+  /** Takes over a session authorized by another node. */
+  async #adopt(record: SessionRecord): Promise<Session> {
+    const stale = this.sessions.get(record.clientId);
+    if (stale?.id === record.sessionId && stale.connected) return stale;
+    if (stale) this.#drop(stale);
+
+    const data = record.data ?? {};
+    const session = await this.#create({
+      clientId: record.clientId,
+      protocol: record.protocol as SoapProtocol,
+      passwordHash: data['passwordHash'] as string | undefined,
+      id: record.sessionId,
+      connectedAt: new Date(record.connectedAt),
+      endpoint: data['endpoint'] as string | undefined,
+    });
+    this.#adopted.add(session);
+    this.#records.set(session, record);
+    this.adoptSession(session);
+    return session;
+  }
+
+  async #create(init: {
+    clientId: string;
+    protocol: SoapProtocol;
+    passwordHash: string | undefined;
+    id?: string;
+    connectedAt?: Date;
+    endpoint?: string | undefined;
+  }): Promise<Session> {
+    const registry = await this.#registry;
+    let session!: Session;
+    const pipeline = this.createPipeline(() => session);
+    session = new SoapSession<CentralSystemActions>({
+      ...init,
+      service: registry.service(init.protocol, 'ChargePoint'),
+      spec: this.spec,
+      outbound: this.outboundAllowed,
+      validation: resolveValidation(this.options.validation),
+      logger: this.logger,
+      callTimeout: this.options.callTimeout ?? 30_000,
+      timeout: this.options.sessionTimeout!,
+      codec: pipeline.codec,
+      onIdle: (s) => this.#idle(s),
+      onClose: (s, reason) => {
+        // Adopted copies expire quietly; the authorizing node reports the disconnect.
+        if (this.#adopted.has(s) && reason === 'Session timeout') this.forgetSession(s);
+        else this.removeSession(s, { reason });
+      },
+    });
+    this.#pipelines.set(session, pipeline);
+    return session;
+  }
+
+  /** A session went silent locally: keep it while other nodes still see traffic. */
+  async #idle(session: Session): Promise<number | undefined> {
+    const record = await this.cluster?.lookup(session.clientId);
+    if (!record || record.sessionId !== session.id) return undefined;
+    const lastSeen = Number(record.data?.['lastSeen'] ?? 0);
+    const remaining = lastSeen + this.options.sessionTimeout! - Date.now();
+    return remaining > 0 ? remaining : undefined;
+  }
+
+  #refresh(session: Session) {
+    const record = this.#records.get(session);
+    if (!this.cluster || !record) return;
+    this.cluster
+      .refresh({ ...record, data: this.#data(session) }, this.options.sessionTimeout)
+      .catch((error: unknown) => this.logger.error('Cluster refresh failed', error));
+  }
+
+  #data(session: Session): Record<string, unknown> {
+    return {
+      endpoint: session.endpoint,
+      passwordHash: session.passwordHash,
+      lastSeen: session.lastSeen.getTime(),
+    };
+  }
+
+  #drop(session: Session) {
+    session.discard();
+    this.forgetSession(session);
+  }
+
+  // --- cluster hooks ------------------------------------------------------------
+
+  protected override clusterRegistration(session: Session) {
+    return { bound: false, ttl: this.options.sessionTimeout, data: this.#data(session) };
+  }
+
+  protected override onRegistered(session: Session, record: SessionRecord): void {
+    this.#records.set(session, record);
+    this.#refresh(session);
+  }
+
+  /** The charge point was (re-)authorized elsewhere: our copy is outdated. */
+  protected override onRemoteConnected(_info: SessionInfo, record: SessionRecord): void {
+    const local = this.sessions.get(record.clientId);
+    if (local && local.id !== record.sessionId) this.#drop(local);
+  }
+
+  protected override onRemoteDisconnected(info: SessionInfo): void {
+    const local = this.sessions.get(info.clientId);
+    if (local?.id === info.sessionId) this.#drop(local);
+  }
+
+  /** Any node can call a SOAP charge point directly: adopt its session from the store. */
+  protected override async sendRemote(
+    clientId: string,
+    action: string,
+    payload: unknown,
+    options: CallOptions,
+  ): Promise<unknown> {
+    const record = await this.cluster?.lookup(clientId);
+    if (!record) throw new ConnectionError(`Client ${clientId} is not connected`);
+    const session = await this.#adopt(record);
+    return (session.send as (a: string, p: unknown, o: CallOptions) => Promise<unknown>).call(
+      session,
+      action,
+      payload,
+      options,
+    );
+  }
+}
+
+/** Passwords are only kept (and shared via the cluster store) as salted hashes. */
+function hashPassword(clientId: string, password: string | undefined): string | undefined {
+  return password === undefined
+    ? undefined
+    : createHash('sha256').update(`${clientId}:${password}`).digest('hex');
 }

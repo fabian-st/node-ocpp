@@ -5,12 +5,19 @@ import {
   type ServerOptions as TlsServerOptions,
 } from 'node:https';
 import type { AddressInfo } from 'node:net';
+import {
+  Cluster,
+  type ClusterOptions,
+  type SessionInfo,
+  type SessionRecord,
+} from './cluster/cluster.js';
 import { PayloadCodec, type PayloadValidator } from './codec.js';
 import { ConnectionRequest, type ConnectionDecision } from './connection-request.js';
 import { ConnectionError, type ValidationError } from './errors.js';
+import { reviveDates } from './dates.js';
 import { InboundDispatcher } from './inbound.js';
 import { silentLogger, type Logger } from './logger.js';
-import type { ProtocolSpec } from './protocol.js';
+import { messageName, type ProtocolSpec } from './protocol.js';
 import { Router } from './router.js';
 import type { OcppSession } from './session.js';
 import type {
@@ -56,6 +63,11 @@ export interface ServerOptions<
   /** Milliseconds to wait for a response to an outbound call. Default: `30000`. */
   callTimeout?: number;
   logger?: Logger;
+  /**
+   * Join a cluster of server instances sharing `adapter` (e.g. Redis): `send()` reaches
+   * charge points connected to any node, presence and events are cluster-wide.
+   */
+  cluster?: ClusterOptions;
 }
 
 export interface ServerEvents<S> {
@@ -65,6 +77,10 @@ export interface ServerEvents<S> {
   client_disconnected: [session: S, info: { code?: number; reason: string }];
   /** A payload violated its schema while validation is in `warn` mode. */
   validation_error: [error: ValidationError, session: S];
+  /** Cluster: a charge point connected to another node. */
+  remote_client_connected: [info: SessionInfo];
+  /** Cluster: a charge point disconnected from another node. */
+  remote_client_disconnected: [info: SessionInfo, reason: string];
 }
 
 /** Base class of all OCPP central system (server) implementations. */
@@ -81,6 +97,8 @@ export abstract class OcppServer<
   protected readonly inboundAllowed: ReadonlySet<string>;
   /** Actions this server may send. */
   protected readonly outboundAllowed: ReadonlySet<string>;
+  /** Cluster membership, if `cluster` is configured. */
+  protected readonly cluster: Cluster | undefined;
   readonly #sessions = new Map<string, S>();
   #httpServer: HttpServer | undefined;
 
@@ -94,11 +112,49 @@ export abstract class OcppServer<
     );
     this.inboundAllowed = new Set(spec.clientActions.filter((a) => allowed.has(a)));
     this.outboundAllowed = new Set(spec.serverActions.filter((a) => allowed.has(a)));
+    this.cluster =
+      options.cluster &&
+      new Cluster(
+        { namespace: `ocpp:${spec.subprotocol}`, ...options.cluster },
+        {
+          localSession: (clientId) => this.#sessions.get(clientId),
+          remoteConnected: (info, record) => {
+            this.onRemoteConnected(info, record);
+            this.emit('remote_client_connected', info);
+          },
+          remoteDisconnected: (info, reason) => {
+            this.onRemoteDisconnected(info);
+            this.emit('remote_client_disconnected', info, reason);
+          },
+          evict: (session) => this.evictSession(session as S),
+        },
+        this.logger,
+      );
   }
 
-  /** Currently connected sessions by client id. */
+  /** Sessions connected to this node, by client id. */
   get sessions(): ReadonlyMap<string, S> {
     return this.#sessions;
+  }
+
+  /** Whether `clientId` is connected — to this node or, in a cluster, to any node. */
+  async isConnected(clientId: string): Promise<boolean> {
+    return (await this.locate(clientId)) !== undefined;
+  }
+
+  /** Where `clientId` is connected, if at all. */
+  async locate(clientId: string): Promise<SessionInfo | undefined> {
+    const local = this.#sessions.get(clientId);
+    if (local && local.connected) return this.#info(local);
+    const record = await this.cluster?.lookup(clientId);
+    return record && this.cluster!.info(record);
+  }
+
+  /** Ids of all connected clients (cluster-wide, if clustered). */
+  async clientIds(): Promise<string[]> {
+    const ids = new Set(this.#sessions.keys());
+    for (const record of (await this.cluster?.records()) ?? []) ids.add(record.clientId);
+    return [...ids];
   }
 
   /** Registers the handler for calls of `action` from charge points (replaces any previous one). */
@@ -136,8 +192,9 @@ export abstract class OcppServer<
   ): Promise<ResponseOf<Out, P>>;
   async send(clientId: string, action: string, payload: unknown, options?: CallOptions) {
     const session = this.#sessions.get(clientId);
-    if (!session) throw new ConnectionError(`Client ${clientId} is not connected`);
-    return (session.send as (a: string, p: unknown, o?: CallOptions) => Promise<unknown>)(
+    if (!session) return this.sendRemote(clientId, action, payload, options ?? {});
+    return (session.send as (a: string, p: unknown, o?: CallOptions) => Promise<unknown>).call(
+      session,
       action,
       payload,
       options,
@@ -153,6 +210,7 @@ export abstract class OcppServer<
     hostname = this.options.hostname ?? 'localhost',
   ): Promise<AddressInfo> {
     if (this.#httpServer) throw new Error('Server is already listening');
+    await this.cluster?.ready();
     const { tls, certificateAuth } = this.options;
     const server = tls
       ? createHttpsServer({
@@ -192,6 +250,7 @@ export abstract class OcppServer<
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
+    await this.cluster?.close();
   }
 
   // --- for subclasses ---------------------------------------------------------
@@ -243,11 +302,73 @@ export abstract class OcppServer<
       this.logger.info(`[${session.clientId}] replaced by a new connection`);
       void previous.close();
     }
+    this.cluster
+      ?.register(session, this.clusterRegistration(session))
+      .then((record) => this.onRegistered(session, record))
+      .catch((error: unknown) => this.logger.error('Cluster registration failed', error));
     this.emit('client_connected', session);
   }
 
   protected removeSession(session: S, info: { code?: number; reason: string }): void {
     if (this.#sessions.get(session.clientId) === session) this.#sessions.delete(session.clientId);
+    this.cluster
+      ?.unregister(session, info.reason)
+      .catch((error: unknown) => this.logger.error('Cluster unregistration failed', error));
     this.emit('client_disconnected', session, info);
+  }
+
+  /** Tracks a session locally without announcing it (it is already known cluster-wide). */
+  protected adoptSession(session: S): void {
+    this.#sessions.set(session.clientId, session);
+  }
+
+  /** Drops a local session without announcing anything. */
+  protected forgetSession(session: S): void {
+    if (this.#sessions.get(session.clientId) === session) this.#sessions.delete(session.clientId);
+  }
+
+  // --- cluster hooks ------------------------------------------------------------
+
+  /** Calls a charge point not connected to this node. */
+  protected async sendRemote(
+    clientId: string,
+    action: string,
+    payload: unknown,
+    options: CallOptions,
+  ): Promise<unknown> {
+    const record = await this.cluster?.lookup(clientId);
+    if (!record) throw new ConnectionError(`Client ${clientId} is not connected`);
+    const callTimeout = this.options.callTimeout ?? 30_000;
+    const wire = await this.cluster!.call(record, action, payload, options, callTimeout);
+    return reviveDates(wire, this.spec.dateFields[messageName(action, 'response')]);
+  }
+
+  /** How a new session is recorded in the cluster. */
+  protected clusterRegistration(_session: S): {
+    bound: boolean;
+    ttl?: number;
+    data?: Record<string, unknown>;
+  } {
+    return { bound: true };
+  }
+
+  protected onRegistered(_session: S, _record: SessionRecord): void {}
+  protected onRemoteConnected(_info: SessionInfo, _record: SessionRecord): void {}
+  protected onRemoteDisconnected(_info: SessionInfo): void {}
+
+  /** Closes a local session superseded by a newer connection on another node. */
+  protected evictSession(session: S): void {
+    void session.close();
+  }
+
+  #info(session: S): SessionInfo {
+    return {
+      clientId: session.clientId,
+      sessionId: session.id,
+      nodeId: this.cluster?.nodeId ?? 'local',
+      protocol: session.protocol,
+      connectedAt: session.connectedAt,
+      local: true,
+    };
   }
 }

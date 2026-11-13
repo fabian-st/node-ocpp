@@ -23,8 +23,14 @@ export interface SoapSessionInit {
   callTimeout: number;
   /** Milliseconds of silence after which the session expires. */
   timeout: number;
-  /** HTTP Basic password the session was authorized with. */
-  password: string | undefined;
+  /** Hash of the HTTP Basic password the session was authorized with. */
+  passwordHash: string | undefined;
+  /** Session id and start, when adopting a session known to the cluster. */
+  id?: string;
+  connectedAt?: Date;
+  endpoint?: string | undefined;
+  /** Asked when the session went silent: ms to extend it by, or `undefined` to end it. */
+  onIdle: (session: SoapSession<any>) => Promise<number | undefined>;
   onClose: (session: SoapSession<any>, reason: string) => void;
 }
 
@@ -34,19 +40,25 @@ export interface SoapSessionInit {
  */
 export class SoapSession<Out extends ActionMap = ActionMap> extends OcppSession<Out> {
   declare readonly protocol: SoapProtocol;
-  /** @internal */ readonly password: string | undefined;
+  /** @internal */ readonly passwordHash: string | undefined;
   readonly #o: SoapSessionInit;
   readonly #queue = new CallQueue();
   #endpoint: string | undefined;
   #caller: SoapCaller | undefined;
   #timer: NodeJS.Timeout | undefined;
+  #lastSeen = Date.now();
   #closed = false;
 
   /** @internal Created by the server. */
   constructor(init: SoapSessionInit) {
-    super(init.clientId, init.protocol);
+    super(init.clientId, init.protocol, {
+      ...(init.id && { id: init.id }),
+      ...(init.connectedAt && { connectedAt: init.connectedAt }),
+    });
     this.#o = init;
-    this.password = init.password;
+    this.passwordHash = init.passwordHash;
+    this.#endpoint = init.endpoint;
+    this.#schedule(init.timeout);
   }
 
   get connected(): boolean {
@@ -58,19 +70,41 @@ export class SoapSession<Out extends ActionMap = ActionMap> extends OcppSession<
     return this.#endpoint;
   }
 
+  /** When the charge point was last heard of. */
+  get lastSeen(): Date {
+    return new Date(this.#lastSeen);
+  }
+
   /** @internal Records activity (and the latest endpoint) of the charge point. */
   touch(endpoint: string | undefined): void {
     if (endpoint && endpoint !== WSA_ANONYMOUS && endpoint !== this.#endpoint) {
       this.#endpoint = endpoint;
       if (this.#caller) this.#caller.endpoint = endpoint;
     }
-    clearTimeout(this.#timer);
-    this.#timer = setTimeout(() => void this.#end('Session timeout'), this.#o.timeout);
-    this.#timer.unref();
+    this.#lastSeen = Date.now();
+    this.#schedule(this.#o.timeout);
   }
 
   async close(): Promise<void> {
-    await this.#end('Closed');
+    await this.#end('Closed', true);
+  }
+
+  /** @internal Ends the session silently (it ended elsewhere in the cluster). */
+  discard(): void {
+    void this.#end('Discarded', false);
+  }
+
+  #schedule(ms: number) {
+    clearTimeout(this.#timer);
+    this.#timer = setTimeout(() => void this.#idle(), ms);
+    this.#timer.unref();
+  }
+
+  async #idle() {
+    const extend = await this.#o.onIdle(this).catch(() => undefined);
+    if (this.#closed) return;
+    if (extend !== undefined && extend > 0) this.#schedule(extend);
+    else await this.#end('Session timeout', true);
   }
 
   protected async call(
@@ -107,11 +141,11 @@ export class SoapSession<Out extends ActionMap = ActionMap> extends OcppSession<
     return this.#caller;
   }
 
-  async #end(reason: string) {
+  async #end(reason: string, notify: boolean) {
     if (this.#closed) return;
     this.#closed = true;
     clearTimeout(this.#timer);
     this.#queue.clear(new ConnectionError(`Session ${this.clientId} ended: ${reason}`));
-    this.#o.onClose(this, reason);
+    if (notify) this.#o.onClose(this, reason);
   }
 }
