@@ -1,0 +1,73 @@
+{
+  "name": "node-ocpp",
+  "version": "0.1.0",
+  "description": "Typed, schema-validated OCPP 1.6J, 1.6S (SOAP) and 2.0.1 client & server components for Node.js",
+  "license": "ISC",
+  "author": "",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./ocpp16j": {
+      "types": "./dist/ocpp16j/index.d.ts",
+      "default": "./dist/ocpp16j/index.js"
+    },
+    "./ocpp16": {
+      "types": "./dist/ocpp16j/index.d.ts",
+      "default": "./dist/ocpp16j/index.js"
+    },
+    "./ocpp16s": {
+      "types": "./dist/ocpp16s/index.d.ts",
+      "default": "./dist/ocpp16s/index.js"
+    },
+    "./ocpp201": {
+      "types": "./dist/ocpp201/index.d.ts",
+      "default": "./dist/ocpp201/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "schemas"
+  ],
+  "sideEffects": false,
+  "keywords": [
+    "ocpp",
+    "ocpp1.6",
+    "ocpp2.0.1",
+    "ev",
+    "charging",
+    "websocket",
+    "soap"
+  ],
+  "scripts": {
+    "generate": "node scripts/generate-types.ts && prettier --log-level warn --write \"src/*/*.generated.ts\"",
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "format": "prettier --write .",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build"
+  },
+  "dependencies": {
+    "@xmldom/xmldom": "^0.9.12",
+    "ajv": "^8.20.0",
+    "ajv-draft-04": "^1.0.0",
+    "ajv-formats": "^3.0.1",
+    "soap": "^1.14.0",
+    "ws": "^8.22.0",
+    "xmllint-wasm": "^5.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@types/ws": "^8.18.2",
+    "prettier": "^3.9.10",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.5"
+  }
+}

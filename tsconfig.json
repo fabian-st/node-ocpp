@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "types": ["node"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "outDir": "dist",
+    "rootDir": ".",
+    "paths": {
+      "node-ocpp": ["./src/index.ts"],
+      "node-ocpp/ocpp16": ["./src/ocpp16j/index.ts"],
+      "node-ocpp/*": ["./src/*/index.ts"]
+    }
+  },
+  "include": ["src", "test", "scripts", "examples"]
+}
